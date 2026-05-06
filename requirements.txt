@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+tensorflow-cpu
+rasterio
+geopandas
+shapely
+opencv-python-headless
+pillow
