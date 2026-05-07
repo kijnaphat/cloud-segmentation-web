@@ -8,6 +8,8 @@ from threading import Lock
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 from pipeline import (
     make_preview_png,
@@ -25,6 +27,9 @@ STATIC.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="Cloud Segmentation Web")
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
+# Thread pool สำหรับงาน CPU-heavy (segment, shapefile)
+_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
 # -------------------------
 # In-memory progress store
 # -------------------------
@@ -38,9 +43,13 @@ def _set_progress(run_id: str, percent: int, stage: str, message: str, status: s
         "percent": int(max(0, min(100, percent))),
         "stage": str(stage),
         "message": str(message),
-        "status": str(status),  # pending | running | done | error
+        "status": str(status),
     }
     if extra:
+        # Translate partial_overlay_name → partial_overlay_url for the client
+        if "partial_overlay_name" in extra and extra["partial_overlay_name"]:
+            extra = dict(extra)
+            extra["partial_overlay_url"] = f"/api/file/{run_id}/{extra.pop('partial_overlay_name')}"
         payload.update(extra)
 
     with _PROGRESS_LOCK:
@@ -140,7 +149,7 @@ async def api_segment(
     overlap: int = Form(96),
     threshold: float = Form(0.5),
     shadow_threshold: float = Form(0.5),
-    preprocess: str = Form("auto"),   # auto | sr_global | div10000 | perband_minmax
+    preprocess: str = Form("auto"),
     batch_size: int = Form(4),
 ):
     run_dir = RUNS / run_id
@@ -177,21 +186,11 @@ async def api_segment(
         preprocess = "auto"
 
     out_mask_any = run_dir / "mask_full.tif"
-    out_overlay = run_dir / "overlay.png"
+    out_overlay  = run_dir / "overlay.png"
 
-    _set_progress(
-        run_id,
-        1,
-        "segment_init",
-        "เริ่มต้น segment",
-        status="running",
-        extra={
-            "tile": tile,
-            "overlap": overlap,
-            "batch_size": batch_size,
-            "preprocess": preprocess,
-        },
-    )
+    _set_progress(run_id, 1, "segment_init", "เริ่มต้น segment", status="running",
+                  extra={"tile": tile, "overlap": overlap,
+                         "batch_size": batch_size, "preprocess": preprocess})
 
     def progress_cb(data: dict):
         _set_progress(
@@ -200,78 +199,69 @@ async def api_segment(
             str(data.get("stage", "segmenting")),
             str(data.get("message", "กำลังประมวลผล")),
             status="running",
+            extra={k: v for k, v in data.items()
+                   if k not in ("percent", "stage", "message")} or None,
         )
 
-    try:
-        info = run_segmentation_pipeline(
-            blue=b,
-            green=g,
-            red=r,
-            nir=n,
+    def _run_sync():
+        return run_segmentation_pipeline(
+            blue=b, green=g, red=r, nir=n,
             model_path=model_file,
             out_mask_tif=out_mask_any,
             out_overlay_png=out_overlay,
-            tile=tile,
-            overlap=overlap,
+            tile=tile, overlap=overlap,
             threshold=float(threshold),
             shadow_threshold=float(shadow_threshold),
             preprocess=preprocess,
             batch_size=batch_size,
             progress_callback=progress_cb,
+            out_partial_dir=run_dir,
         )
+
+    loop = asyncio.get_event_loop()
+    try:
+        # รัน CPU-heavy pipeline ใน thread pool แยก — FastAPI event loop ไม่บล็อก
+        info = await loop.run_in_executor(_EXECUTOR, _run_sync)
     except Exception as e:
-        _set_progress(
-            run_id,
-            100,
-            "segment_error",
-            f"segment failed: {str(e)}",
-            status="error",
-        )
+        _set_progress(run_id, 100, "segment_error",
+                      f"segment failed: {str(e)}", status="error")
         return JSONResponse({"error": f"segment failed: {str(e)}"}, status_code=500)
 
-    mask_cloud_url = f"/api/file/{run_id}/{info['mask_cloud_name']}"
+    mask_cloud_url  = f"/api/file/{run_id}/{info['mask_cloud_name']}"
     mask_shadow_url = f"/api/file/{run_id}/{info['mask_shadow_name']}"
-    mask_class_url = f"/api/file/{run_id}/{info['mask_class_name']}"
-    overlay_url = f"/api/file/{run_id}/{info['overlay_name']}"
+    mask_class_url  = f"/api/file/{run_id}/{info['mask_class_name']}"
+    overlay_url     = f"/api/file/{run_id}/{info['overlay_name']}"
 
-    _set_progress(
-        run_id,
-        100,
-        "done",
-        "Segment เสร็จสิ้น",
-        status="done",
-        extra={
-            "chosen_preprocess": info["chosen_preprocess"],
-            "chosen_cloud_threshold": info["chosen_cloud_threshold"],
-            "chosen_shadow_threshold": info["chosen_shadow_threshold"],
-            "batch_size": info.get("batch_size", batch_size),
-            "stride": info.get("stride"),
-            "tiles_total": info.get("tiles_total"),
-            "tiles_used": info.get("tiles_used"),
-            "tiles_skipped": info.get("tiles_skipped"),
-            "mask_cloud_url": mask_cloud_url,
-            "mask_shadow_url": mask_shadow_url,
-            "mask_any_url": mask_class_url,
-            "overlay_url": overlay_url,
-        },
-    )
+    _set_progress(run_id, 100, "done", "Segment เสร็จสิ้น", status="done",
+                  extra={
+                      "chosen_preprocess":       info["chosen_preprocess"],
+                      "chosen_cloud_threshold":  info["chosen_cloud_threshold"],
+                      "chosen_shadow_threshold": info["chosen_shadow_threshold"],
+                      "batch_size":   info.get("batch_size", batch_size),
+                      "stride":       info.get("stride"),
+                      "tiles_total":  info.get("tiles_total"),
+                      "tiles_used":   info.get("tiles_used"),
+                      "tiles_skipped":info.get("tiles_skipped"),
+                      "mask_cloud_url":  mask_cloud_url,
+                      "mask_shadow_url": mask_shadow_url,
+                      "mask_any_url":    mask_class_url,
+                      "overlay_url":     overlay_url,
+                  })
 
-    return JSONResponse(
-        {
-            "chosen_preprocess": info["chosen_preprocess"],
-            "chosen_cloud_threshold": info["chosen_cloud_threshold"],
-            "chosen_shadow_threshold": info["chosen_shadow_threshold"],
-            "mask_cloud_url": mask_cloud_url,
-            "mask_shadow_url": mask_shadow_url,
-            "mask_any_url": mask_class_url,
-            "overlay_url": overlay_url,
-            "batch_size": info.get("batch_size", batch_size),
-            "stride": info.get("stride"),
-            "tiles_total": info.get("tiles_total"),
-            "tiles_used": info.get("tiles_used"),
-            "tiles_skipped": info.get("tiles_skipped"),
-        }
-    )
+    return JSONResponse({
+        "chosen_preprocess":       info["chosen_preprocess"],
+        "chosen_cloud_threshold":  info["chosen_cloud_threshold"],
+        "chosen_shadow_threshold": info["chosen_shadow_threshold"],
+        "mask_cloud_url":  mask_cloud_url,
+        "mask_shadow_url": mask_shadow_url,
+        "mask_any_url":    mask_class_url,
+        "overlay_url":     overlay_url,
+        "batch_size":   info.get("batch_size", batch_size),
+        "stride":       info.get("stride"),
+        "tiles_total":  info.get("tiles_total"),
+        "tiles_used":   info.get("tiles_used"),
+        "tiles_skipped":info.get("tiles_skipped"),
+    })
 
 
 @app.post("/api/shapefile")

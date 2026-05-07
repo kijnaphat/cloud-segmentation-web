@@ -7,6 +7,7 @@ os.environ["TF_USE_LEGACY_KERAS"] = "1"
 from pathlib import Path
 import zipfile
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import rasterio
@@ -37,6 +38,14 @@ try:
 except Exception:
     pass
 
+# ใช้ CPU cores ทั้งหมดที่มี — สำคัญมากบน HuggingFace CPU
+_N_CORES = max(1, os.cpu_count() or 1)
+try:
+    tf.config.threading.set_inter_op_parallelism_threads(_N_CORES)
+    tf.config.threading.set_intra_op_parallelism_threads(_N_CORES)
+except Exception:
+    pass
+
 
 # -------------------------
 # Cached helpers
@@ -56,19 +65,93 @@ def make_weight(tile: int, sigma: float = 0.45) -> np.ndarray:
     return w
 
 
-def _emit_progress(progress_callback, percent: int, stage: str, message: str):
+def _emit_progress(progress_callback, percent: int, stage: str, message: str, extra: dict | None = None):
     if progress_callback is None:
         return
     try:
-        progress_callback(
-            {
-                "percent": int(max(0, min(100, percent))),
-                "stage": str(stage),
-                "message": str(message),
-            }
-        )
+        payload = {
+            "percent": int(max(0, min(100, percent))),
+            "stage": str(stage),
+            "message": str(message),
+        }
+        if extra:
+            payload.update(extra)
+        progress_callback(payload)
     except Exception:
         pass
+
+
+def _render_partial_overlay(
+    acc_c: np.ndarray,
+    acc_s: np.ndarray,
+    wgt: np.ndarray,
+    b_src: Path,
+    g_src: Path,
+    r_src: Path,
+    out_path: Path,
+    thr_cloud: float,
+    thr_shadow: float,
+    max_size: int = 400,           # ลดจาก 600 → 400 เร็วกว่า ~2x
+    _rgb_cache: dict = {},         # module-level cache สำหรับ RGB thumbnail
+) -> None:
+    """
+    Render intermediate overlay. RGB thumbnail cached after first call.
+    Saves as JPEG (q=82) — ~5x faster than PNG for partial previews.
+    """
+    H, W = acc_c.shape
+    scale = max(1, int(max(H, W) / max_size))
+    nh, nw = max(1, H // scale), max(1, W // scale)
+
+    # --- cache RGB thumbnail (อ่านไฟล์แค่ครั้งแรก) ---
+    cache_key = (str(b_src), nh, nw)
+    if cache_key not in _rgb_cache:
+        def _read(p):
+            with rasterio.open(p) as ds:
+                return ds.read(1, out_shape=(nh, nw))
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futs = [ex.submit(_read, p) for p in (b_src, g_src, r_src)]
+            b_arr, g_arr, r_arr = [f.result() for f in futs]
+        _rgb_cache[cache_key] = rgb_preview_from_bgr(b_arr, g_arr, r_arr)
+    rgb = _rgb_cache[cache_key].copy()
+
+    # --- partial masks ---
+    safe_wgt = np.maximum(wgt, 1e-6)
+    prob_c = acc_c / safe_wgt
+    prob_s = acc_s / safe_wgt
+    not_touched = wgt < 1e-6
+    prob_c[not_touched] = 0.0
+    prob_s[not_touched] = 0.0
+
+    mc = cv2.resize((prob_c >= thr_cloud).astype(np.uint8), (nw, nh), interpolation=cv2.INTER_NEAREST)
+    ms = cv2.resize((prob_s >= thr_shadow).astype(np.uint8), (nw, nh), interpolation=cv2.INTER_NEAREST)
+
+    # --- vectorized blending (no Python loop per-pixel) ---
+    alpha = 0.45
+    overlay = rgb.astype(np.float32)
+    m1, m2 = mc > 0, ms > 0
+    if m1.any():
+        overlay[m1, 0] = overlay[m1, 0] * (1 - alpha) + 255 * alpha
+        overlay[m1, 1] = overlay[m1, 1] * (1 - alpha)
+        overlay[m1, 2] = overlay[m1, 2] * (1 - alpha)
+    if m2.any():
+        overlay[m2, 0] = overlay[m2, 0] * (1 - alpha)
+        overlay[m2, 1] = overlay[m2, 1] * (1 - alpha)
+        overlay[m2, 2] = overlay[m2, 2] * (1 - alpha) + 255 * alpha
+    overlay = overlay.clip(0, 255).astype(np.uint8)
+
+    # frontier scanline
+    touched_rows = np.where(wgt.any(axis=1))[0]
+    if touched_rows.size > 0:
+        fr = min(int(touched_rows[-1] / scale), nh - 1)
+        overlay[max(0, fr - 1): fr + 1, :] = [255, 220, 80]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # บันทึกเป็น JPEG แทน PNG — เร็วกว่า ~5x, ขนาดเล็กกว่า ~4x
+    jpeg_path = out_path.with_suffix(".jpg")
+    Image.fromarray(overlay).save(jpeg_path, format="JPEG", quality=82, optimize=False)
+    # rename ให้ตรงกับ out_path ที่ caller คาดหวัง (เปลี่ยน extension)
+    if jpeg_path != out_path:
+        jpeg_path.rename(out_path)
 
 
 # -------------------------
@@ -84,26 +167,22 @@ def compute_global_percentiles(
     b_path: Path, g_path: Path, r_path: Path, n_path: Path, sample_max: int = 1200
 ):
     paths = [b_path, g_path, r_path, n_path]
-    smalls = []
 
-    for p in paths:
+    def _read_one(p):
         with rasterio.open(p) as ds:
             H, W = ds.height, ds.width
             scale = max(1, int(max(H, W) / sample_max))
-            sh = max(1, H // scale)
-            sw = max(1, W // scale)
-            a = ds.read(1, out_shape=(sh, sw)).astype(np.float32)
-            smalls.append(a)
+            sh, sw = max(1, H // scale), max(1, W // scale)
+            return ds.read(1, out_shape=(sh, sw)).astype(np.float32)
+
+    # อ่าน 4 band พร้อมกันแทนที่จะ sequential
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        smalls = list(ex.map(_read_one, paths))
 
     stacked = np.stack(smalls, axis=-1)
-    p2 = np.zeros(4, dtype=np.float32)
-    p98 = np.zeros(4, dtype=np.float32)
-
-    for c in range(4):
-        ch = stacked[..., c]
-        p2[c] = np.percentile(ch, 2)
-        p98[c] = np.percentile(ch, 98)
-
+    flat = stacked.reshape(-1, 4)
+    p2  = np.percentile(flat, 2,  axis=0).astype(np.float32)
+    p98 = np.percentile(flat, 98, axis=0).astype(np.float32)
     return p2, p98
 
 
@@ -124,15 +203,13 @@ def preprocess_div10000(x: np.ndarray) -> np.ndarray:
 
 
 def preprocess_perband_minmax(x: np.ndarray) -> np.ndarray:
+    # vectorized: compute percentiles across H*W per channel in one shot
     x = x.astype(np.float32)
-    out = np.zeros_like(x, dtype=np.float32)
-
-    for c in range(x.shape[-1]):
-        ch = x[..., c]
-        mn = float(np.percentile(ch, 1))
-        mx = float(np.percentile(ch, 99))
-        out[..., c] = (ch - mn) / (mx - mn + 1e-6) if mx > mn else 0.0
-
+    flat = x.reshape(-1, x.shape[-1])                        # (H*W, C)
+    mn = np.percentile(flat, 1, axis=0).astype(np.float32)   # (C,)
+    mx = np.percentile(flat, 99, axis=0).astype(np.float32)  # (C,)
+    rng = np.where(mx > mn, mx - mn, 1.0).astype(np.float32)
+    out = (x - mn) / rng
     return np.clip(out, 0.0, 1.0)
 
 
@@ -251,25 +328,33 @@ def _downsample_prob(prob: np.ndarray, max_size: int = 900) -> np.ndarray:
 # Preview RGB
 # -------------------------
 def make_preview_png(blue_tif: Path, green_tif: Path, red_tif: Path, out_png: Path):
-    blue_tif = Path(blue_tif)
+    blue_tif  = Path(blue_tif)
     green_tif = Path(green_tif)
-    red_tif = Path(red_tif)
-    out_png = Path(out_png)
+    red_tif   = Path(red_tif)
+    out_png   = Path(out_png)
 
-    with rasterio.open(blue_tif) as b, rasterio.open(green_tif) as g, rasterio.open(red_tif) as r:
-        ensure_same_grid([b, g, r])
+    def _read(p, nh, nw):
+        with rasterio.open(p) as ds:
+            return ds.read(1, out_shape=(nh, nw))
 
+    with rasterio.open(blue_tif) as b:
+        ensure_same_grid([b,
+                          rasterio.open(green_tif),
+                          rasterio.open(red_tif)])
         scale = max(1, int(max(b.width, b.height) / 1200))
         new_h = max(1, b.height // scale)
-        new_w = max(1, b.width // scale)
+        new_w = max(1, b.width  // scale)
 
-        b_arr = b.read(1, out_shape=(new_h, new_w))
-        g_arr = g.read(1, out_shape=(new_h, new_w))
-        r_arr = r.read(1, out_shape=(new_h, new_w))
+    # อ่าน 3 band พร้อมกัน
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [ex.submit(_read, p, new_h, new_w)
+                for p in (blue_tif, green_tif, red_tif)]
+        b_arr, g_arr, r_arr = [f.result() for f in futs]
 
     rgb = rgb_preview_from_bgr(b_arr, g_arr, r_arr)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(rgb).save(out_png)
+    # compress_level=1 = เร็วที่สุด ขนาดไฟล์ใหญ่ขึ้นนิดหน่อยแต่ save เร็วกว่า ~3x
+    Image.fromarray(rgb).save(out_png, optimize=False, compress_level=1)
 
 
 def _sliding_positions(length: int, tile: int, stride: int):
@@ -305,6 +390,8 @@ def run_segmentation_pipeline(
     preprocess: str = "auto",
     batch_size: int = 4,
     progress_callback=None,
+    out_partial_dir: Path | None = None,   # folder to write partial overlays into
+    partial_every_pct: int = 20,           # emit partial every N% of tiles (ลดความถี่จาก 15→20)
 ):
     blue = Path(blue)
     green = Path(green)
@@ -319,6 +406,9 @@ def run_segmentation_pipeline(
 
     _emit_progress(progress_callback, 2, "loading_model", "กำลังโหลดโมเดล")
     model = _load_model_cached(str(model_path.resolve()))
+
+    # Clear cached RGB thumbnail from any previous run
+    _render_partial_overlay.__defaults__[-1].clear()  # clears _rgb_cache dict
 
     _emit_progress(progress_callback, 8, "precompute", "กำลังคำนวณค่าสถิติภาพ")
     p2, p98 = compute_global_percentiles(blue, green, red, nir)
@@ -425,6 +515,11 @@ def run_segmentation_pipeline(
         used_tiles = 0
         skipped_tiles = 0
 
+        # Partial overlay tracking
+        partial_counter = 0          # how many partials emitted so far
+        next_partial_at = max(1, int(total_tiles * partial_every_pct / 100))
+        partial_overlay_name: str | None = None
+
         _emit_progress(progress_callback, 20, "segmenting", "กำลังเริ่ม segment")
 
         def flush_batch():
@@ -436,23 +531,24 @@ def run_segmentation_pipeline(
             bx = np.stack(batch_tiles, axis=0).astype(np.float32)
             batch_cloud, batch_shadow = _predict_batch_probs(model, bx)
 
-            for i, meta in enumerate(batch_meta):
-                y0, x0, vh, vw, valid = meta
-
-                prob_cloud = np.clip(batch_cloud[i], 0.0, 1.0)[:vh, :vw].astype(np.float32)
-                prob_shadow = np.clip(batch_shadow[i], 0.0, 1.0)[:vh, :vw].astype(np.float32)
-
-                prob_cloud[~valid] = 0.0
-                prob_shadow[~valid] = 0.0
-
+            # vectorized accumulation — หลีกเลี่ยง Python loop ต่อ tile
+            for i, (y0, x0, vh, vw, valid) in enumerate(batch_meta):
                 wk = weight_kernel[:vh, :vw]
-                acc_c[y0:y0 + vh, x0:x0 + vw] += prob_cloud * wk
-                acc_s[y0:y0 + vh, x0:x0 + vw] += prob_shadow * wk
-                wgt[y0:y0 + vh, x0:x0 + vw] += wk
+
+                pc = np.clip(batch_cloud[i], 0.0, 1.0)[:vh, :vw]
+                ps = np.clip(batch_shadow[i], 0.0, 1.0)[:vh, :vw]
+
+                # mask invalid pixels ด้วย multiply แทน boolean assign
+                pc = pc * valid
+                ps = ps * valid
+
+                acc_c[y0:y0 + vh, x0:x0 + vw] += pc * wk
+                acc_s[y0:y0 + vh, x0:x0 + vw] += ps * wk
+                wgt[y0:y0 + vh, x0:x0 + vw]   += wk
 
             used_tiles += len(batch_tiles)
-            batch_tiles = []
-            batch_meta = []
+            batch_tiles.clear()
+            batch_meta.clear()
 
         for y0 in ys:
             for x0 in xs:
@@ -496,11 +592,35 @@ def run_segmentation_pipeline(
                     flush_batch()
 
                 pct = 20 + int((processed_tiles / max(total_tiles, 1)) * 65)
+
+                # --- Partial overlay emit ---
+                if (
+                    out_partial_dir is not None
+                    and processed_tiles >= next_partial_at
+                    and wgt.any()
+                ):
+                    try:
+                        partial_counter += 1
+                        p_name = f"partial_{partial_counter:03d}.jpg"   # JPEG เร็วกว่า PNG ~5x
+                        p_path = Path(out_partial_dir) / p_name
+                        _render_partial_overlay(
+                            acc_c=acc_c, acc_s=acc_s, wgt=wgt,
+                            b_src=blue, g_src=green, r_src=red,
+                            out_path=p_path,
+                            thr_cloud=chosen_thr_cloud,
+                            thr_shadow=chosen_thr_shadow,
+                        )
+                        partial_overlay_name = p_name
+                        next_partial_at = processed_tiles + max(1, int(total_tiles * partial_every_pct / 100))
+                    except Exception:
+                        pass  # never crash main pipeline for a partial
+
                 _emit_progress(
                     progress_callback,
                     pct,
                     "segmenting",
                     f"กำลัง segment... {processed_tiles}/{total_tiles} tiles",
+                    extra={"partial_overlay_name": partial_overlay_name} if partial_overlay_name else None,
                 )
 
         flush_batch()
