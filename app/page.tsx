@@ -8,7 +8,7 @@ const STEPS = [
 ];
 
 const SPECS = [
-  { label: "Model",      value: "U-Net  ·  Keras H5" },
+  { label: "Model",      value: "DeepLabV3+  ·  Keras H5" },
   { label: "Classes",    value: "Cloud  ·  Shadow" },
   { label: "Tile size",  value: "480 × 480 px" },
   { label: "Overlap",    value: "96 px" },
