@@ -1,10 +1,64 @@
+// app/page.tsx
+"use client";
 import Link from "next/link";
+import { useEffect, useState } from "react";
+
+function VisitorCounter() {
+  const [target, setTarget] = useState<number | null>(null);
+  const [display, setDisplay] = useState(0);
+  const [show, setShow] = useState(false);
+
+  useEffect(() => {
+    fetch("https://api.countapi.xyz/hit/cloud-segmentation-web.vercel.app/visits")
+      .then(r => r.json())
+      .then(j => { setTarget(j.value ?? null); setTimeout(() => setShow(true), 80); })
+      .catch(() => {
+        try {
+          const n = parseInt(localStorage.getItem("__cs_v") || "0", 10) + 1;
+          localStorage.setItem("__cs_v", String(n));
+          setTarget(n); setTimeout(() => setShow(true), 80);
+        } catch {}
+      });
+  }, []);
+
+  useEffect(() => {
+    if (target === null) return;
+    const duration = 1400;
+    const steps = 60;
+    const stepMs = duration / steps;
+    let current = 0;
+    const timer = setInterval(() => {
+      current++;
+      setDisplay(Math.round((current / steps) * target));
+      if (current >= steps) { setDisplay(target); clearInterval(timer); }
+    }, stepMs);
+    return () => clearInterval(timer);
+  }, [target]);
+
+  return (
+    <div className={`vc-wrap${show ? " vc-in" : ""}`}>
+      <div className="vc-inner">
+        <div className="vc-dot-wrap">
+          <span className="vc-dot" />
+          <span className="vc-dot-ring" />
+        </div>
+        <div className="vc-body">
+          <div className="vc-number">
+            {target === null ? "—" : display.toLocaleString()}
+          </div>
+          <div className="vc-label">Total Visitors</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 const STEPS = [
-  { n: "01", title: "Upload",       desc: "อัปโหลด 4 band GeoTIFF (Blue, Green, Red, NIR) จากดาวเทียม Landsat หรือ Sentinel" },
-  { n: "02", title: "Preview",      desc: "ระบบ render RGB preview จาก 3 bands ให้เห็นภาพดาวเทียมก่อนประมวลผล" },
-  { n: "03", title: "Tile Inference",desc: "โมเดล CNN วิ่ง sliding-window บนภาพทีละ tile ขนาด 480×480 px แบบ batch" },
-  { n: "04", title: "Output",       desc: "ได้ Cloud mask, Shadow mask, Overlay PNG และ Shapefile พร้อม download" },
+  { n: "01", title: "Upload",        desc: "Upload 4-band GeoTIFF files (Blue, Green, Red, NIR) from Landsat or Sentinel satellites." },
+  { n: "02", title: "Preview",       desc: "The system renders an RGB preview from 3 bands so you can inspect the satellite image before processing." },
+  { n: "03", title: "Tile Inference",desc: "A CNN model runs a sliding-window inference on the image, processing 480×480 px tiles in batches." },
+  { n: "04", title: "Output",        desc: "Get Cloud mask, Shadow mask, Overlay PNG, and Shapefile — all ready to download." },
 ];
 
 const SPECS = [
@@ -158,6 +212,46 @@ export default function HomePage() {
         footer { border-top: 1px solid var(--off2); }
         .footer-in { max-width: 1080px; margin: 0 auto; padding: 24px 24px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
         .footer-text { font-size: 12px; color: var(--text3); }
+
+        /* VISITOR COUNTER */
+        .vc-wrap {
+          display: inline-flex; justify-content: center;
+          margin-top: 36px;
+          opacity: 0; transform: translateY(10px);
+          transition: opacity .6s ease, transform .6s ease;
+        }
+        .vc-wrap.vc-in { opacity: 1; transform: translateY(0); }
+        .vc-inner {
+          display: flex; align-items: center; gap: 16px;
+          padding: 18px 32px; border-radius: 20px;
+          background: var(--white);
+          border: 1px solid var(--off2);
+          box-shadow: 0 8px 32px rgba(0,0,0,0.07), 0 1px 3px rgba(0,0,0,0.04);
+        }
+        .vc-dot-wrap { position: relative; width: 14px; height: 14px; flex-shrink: 0; }
+        .vc-dot {
+          position: absolute; inset: 0;
+          border-radius: 50%; background: #34c759;
+        }
+        .vc-dot-ring {
+          position: absolute; inset: -4px;
+          border-radius: 50%; border: 2px solid #34c759;
+          opacity: 0; animation: vc-ring 2s ease infinite;
+        }
+        @keyframes vc-ring {
+          0%   { transform: scale(.6); opacity: .7; }
+          100% { transform: scale(1.6); opacity: 0; }
+        }
+        .vc-body { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
+        .vc-number {
+          font-size: 42px; font-weight: 700; letter-spacing: -2px;
+          line-height: 1; color: var(--text);
+          font-variant-numeric: tabular-nums;
+        }
+        .vc-label {
+          font-size: 12px; font-weight: 500; letter-spacing: .6px;
+          text-transform: uppercase; color: var(--text3);
+        }
       `}</style>
 
       <nav>
@@ -187,16 +281,17 @@ export default function HomePage() {
           <strong>Segmentation.</strong>
         </h1>
         <p className="hero-sub">
-          อัปโหลด GeoTIFF 4 band แล้วให้ AI ตรวจจับเมฆและเงาดาวเทียม
-          แบบ real-time — ทีละ tile จนได้ mask พร้อมใช้งาน
+          Upload 4-band GeoTIFF files and let AI detect clouds and cloud shadows
+          in real-time — tile by tile — until you have production-ready masks.
         </p>
         <div className="hero-btns">
           <Link href="/segment" className="btn btn-primary">
             Get Started →
           </Link>
-          <a href="#how" className="btn btn-ghost">ดูวิธีการทำงาน</a>
+          <a href="#how" className="btn btn-ghost">How it works</a>
         </div>
         <p className="hero-note">Cloud + Shadow mask · GeoTIFF · Shapefile · Overlay PNG</p>
+        <VisitorCounter />
       </section>
 
       <div className="mockup-wrap">
@@ -259,7 +354,7 @@ export default function HomePage() {
 
       <section className="section" id="how">
         <div className="section-eyebrow">How it works</div>
-        <div className="section-title">4 ขั้นตอน<br/><strong>ตั้งแต่ต้นจนได้ผลลัพธ์</strong></div>
+        <div className="section-title">4 Steps<br/><strong>from upload to results</strong></div>
         <div className="steps-grid">
           {STEPS.map(s => (
             <div className="step-card" key={s.n}>
@@ -275,7 +370,7 @@ export default function HomePage() {
 
       <section className="section">
         <div className="section-eyebrow">Specifications</div>
-        <div className="section-title">รายละเอียด<br/><strong>ของระบบ</strong></div>
+        <div className="section-title">System<br/><strong>Details</strong></div>
         <div className="specs-wrap">
           <div className="spec-card">
             <div className="spec-title">Model</div>
@@ -313,7 +408,7 @@ export default function HomePage() {
 
       <section className="section">
         <div className="section-eyebrow">Our Team</div>
-        <div className="section-title">ทีมผู้พัฒนา<br/><strong>และที่ปรึกษา</strong></div>
+        <div className="section-title">Developers<br/><strong>& Advisor</strong></div>
         
         <div className="team-wrap">
           <div className="team-grid">
@@ -350,8 +445,8 @@ export default function HomePage() {
 
       <section className="cta">
         <div className="cta-in">
-          <h2 className="cta-title">พร้อมใช้งาน<br/><strong>เริ่มได้เลย</strong></h2>
-          <p className="cta-sub">อัปโหลด GeoTIFF แล้วดูผลลัพธ์ภายในไม่กี่นาที</p>
+          <h2 className="cta-title">Ready to use.<br/><strong>Start now.</strong></h2>
+          <p className="cta-sub">Upload your GeoTIFF files and see results in minutes.</p>
           <Link href="/segment" className="btn btn-primary" style={{fontSize:16,padding:"13px 32px"}}>
             Open CloudSeg →
           </Link>
